@@ -1,4 +1,4 @@
-"""Convert UBFC-PHYS videos and contact BVP to paired NumPy clips.
+"""UBFC-PHYS preprocessing compatible with the user's Standardized/uint8 command.
 
 RGB is stored as uint8 THWC. The manifest records one RGB mean/std per full
 recording so the dataset can reproduce recording-level z-score normalization.
@@ -16,6 +16,8 @@ import re
 import cv2
 import numpy as np
 
+from face_crop import build_detectors, determine_face_box
+
 
 MANIFEST_FIELDS = [
     "input_path", "label_path", "subject", "recording", "task", "clip_index",
@@ -26,7 +28,7 @@ AUDIT_FIELDS = [
     "subject", "recording", "task", "source", "bvp_source", "fps",
     "reported_frames", "decoded_frames", "retained_frames", "dropped_tail_frames",
     "clips", "crop", "crop_x1", "crop_y1", "crop_x2", "crop_y2",
-    "input_mean", "input_std", "statistics_scope", "alignment",
+    "input_mean", "input_std", "statistics_scope", "alignment", "detector_status",
 ]
 
 
@@ -45,55 +47,20 @@ def identity(path):
 
 
 def read_bvp(path):
-    """Read the headerless, one-column UBFC-PHYS BVP CSV without silent coercion."""
+    """Match the reference CSV parser (first column, skipping headers/empty rows)."""
     values = []
     with Path(path).open(newline="", encoding="utf-8-sig") as handle:
-        for number, row in enumerate(csv.reader(handle), start=1):
-            if len(row) != 1 or not row[0].strip():
-                raise ValueError("Expected one numeric BVP value at {}:{}".format(path, number))
+        for row in csv.reader(handle):
+            if not row:
+                continue
             try:
                 values.append(float(row[0]))
-            except ValueError as error:
-                raise ValueError("Invalid BVP value at {}:{}".format(path, number)) from error
+            except ValueError:
+                continue
     signal = np.asarray(values, dtype=np.float64)
     if signal.size < 2 or not np.isfinite(signal).all() or np.std(signal) <= 1e-8:
         raise ValueError("BVP must contain finite, nonconstant samples: {}".format(path))
     return signal
-
-
-def face_box(video, search_frames=150, margin=1.5):
-    """Find a static expanded square face box in the first search_frames frames."""
-    detector = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
-    if detector.empty():
-        raise RuntimeError("OpenCV's Haar face detector could not be loaded")
-    capture = cv2.VideoCapture(str(video))
-    try:
-        if not capture.isOpened():
-            raise ValueError("Cannot open video: {}".format(video))
-        for _ in range(search_frames):
-            success, frame = capture.read()
-            if not success:
-                break
-            faces = detector.detectMultiScale(
-                cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), scaleFactor=1.1, minNeighbors=5
-            )
-            if len(faces):
-                x, y, width, height = max(faces, key=lambda box: box[2] * box[3])
-                side = max(width, height) * margin
-                return (
-                    max(0, int(x + width / 2 - side / 2)),
-                    max(0, int(y + height / 2 - side / 2)),
-                    min(frame.shape[1], int(x + width / 2 + side / 2)),
-                    min(frame.shape[0], int(y + height / 2 + side / 2)),
-                )
-    finally:
-        capture.release()
-    raise ValueError(
-        "No face found in the first {} frames of {}. Inspect the recording; "
-        "--crop full-frame is an explicit alternative.".format(search_frames, video)
-    )
 
 
 def _stats(total, squared_total, count, source):
@@ -113,17 +80,23 @@ def validate_dimensions(frames, height, width):
         )
 
 
-def convert_recording(video, bvp_path, out, frames=160, size=128, crop="haar"):
+def convert_recording(video, bvp_path, out, frames=160, size=128, crop="auto",
+                      detectors=None, search_frames=60, margin=1.5,
+                      fix_full_frame_box=False, store_uint8=True):
     """Stream one video to disk; return manifest rows and recording audit data."""
     validate_dimensions(frames, size, size)
-    if crop not in ("haar", "full-frame"):
-        raise ValueError("crop must be haar or full-frame")
+    if crop not in ("auto", "haar", "yolo", "full-frame"):
+        raise ValueError("crop must be auto, haar, yolo, or full-frame")
     video, out = Path(video), Path(out)
     subject, task, recording = identity(video)
     bvp = read_bvp(bvp_path)
-    box = face_box(video) if crop == "haar" else None
+    box, status = None, "explicit corrected full frame"
+    if crop != "full-frame":
+        primary, fallback = detectors if detectors is not None else build_detectors(crop)
+        box, status = determine_face_box(video, primary, search_frames, margin, fallback,
+                                         fix_full_frame_box)
     capture = cv2.VideoCapture(str(video))
-    rows, buffer = [], []
+    rows, buffer, float_frames = [], [], []
     decoded, pixel_count = 0, 0
     total, squared_total = 0.0, 0.0
     original_shape = None
@@ -149,14 +122,15 @@ def convert_recording(video, bvp_path, out, frames=160, size=128, crop="haar"):
                     box = (0, 0, frame.shape[1], frame.shape[0])
             elif frame.shape != original_shape:
                 raise ValueError("Video dimensions changed during decoding: {}".format(video))
-            x1, y1, x2, y2 = box
-            cropped = frame[y1:y2, x1:x2]
+            x, y, width, height = box
+            rgb = cv2.cvtColor(np.asarray(frame), cv2.COLOR_BGR2RGB)
+            cropped = rgb[max(y, 0):min(y + height, rgb.shape[0]),
+                          max(x, 0):min(x + width, rgb.shape[1])]
             if not cropped.size:
                 raise ValueError("Empty crop: {}".format(video))
-            rgb = cv2.cvtColor(
-                cv2.resize(cropped, (size, size), interpolation=cv2.INTER_AREA),
-                cv2.COLOR_BGR2RGB,
-            )
+            rgb = cv2.resize(cropped, (size, size), interpolation=cv2.INTER_AREA)
+            if not store_uint8:
+                float_frames.append(rgb.astype(np.float32))
             values = rgb.astype(np.float64)
             total += float(np.sum(values))
             squared_total += float(np.sum(values * values))
@@ -167,12 +141,14 @@ def convert_recording(video, bvp_path, out, frames=160, size=128, crop="haar"):
                 index = len(rows)
                 input_name = "{}_input{}.npy".format(recording, index)
                 label_name = "{}_label{}.npy".format(recording, index)
-                np.save(out / input_name, np.stack(buffer), allow_pickle=False)
+                if store_uint8:
+                    np.save(out / input_name, np.stack(buffer), allow_pickle=False)
                 rows.append(dict(
                     input_path=input_name, label_path=label_name, subject=subject,
                     recording=recording, task=task, clip_index=index,
                     start_frame=decoded - frames, frames=frames, fps=fps,
-                    height=size, width=size, input_representation="raw",
+                    height=size, width=size,
+                    input_representation="raw" if store_uint8 else "standardized",
                     label_representation="standardized",
                 ))
                 buffer.clear()
@@ -191,25 +167,36 @@ def convert_recording(video, bvp_path, out, frames=160, size=128, crop="haar"):
     aligned = np.interp(
         np.linspace(1, len(bvp), decoded), np.linspace(1, len(bvp), len(bvp)), bvp
     )
-    bvp_std = float(np.std(aligned))
+    centered_bvp = aligned - np.mean(aligned)
+    bvp_std = float(np.std(centered_bvp))
     if not np.isfinite(bvp_std) or bvp_std <= 1e-8:
         raise ValueError("BVP became constant after resampling: {}".format(bvp_path))
-    standardized = ((aligned - np.mean(aligned)) / bvp_std).astype(np.float32)
+    # Keep float64, as produced by the reference's read_signal_csv/transform_label.
+    standardized = centered_bvp / bvp_std
+    if not store_uint8:
+        # Exact reference float32 reduction order; this optional mode holds the
+        # complete resized recording in RAM, unlike the default uint8 path.
+        transformed = np.asarray(float_frames, dtype=np.float32)
+        transformed = transformed - np.mean(transformed)
+        transformed = transformed / np.std(transformed)
     for row in rows:
         start = row["start_frame"]
         label = standardized[start:start + frames]
         if np.std(label) <= 1e-8:
             raise ValueError("Constant BVP in {} clip {}".format(recording, row["clip_index"]))
         np.save(out / row["label_path"], label, allow_pickle=False)
-        row.update(input_mean=mean, input_std=std)
+        if not store_uint8:
+            np.save(out / row["input_path"], transformed[start:start + frames], allow_pickle=False)
+        row.update(input_mean=mean if store_uint8 else 0.0, input_std=std if store_uint8 else 1.0)
     audit = dict(
         subject=subject, recording=recording, task=task, source=str(video.resolve()),
         bvp_source=str(Path(bvp_path).resolve()), fps=fps, reported_frames=reported_frames,
         decoded_frames=decoded, retained_frames=len(rows) * frames,
         dropped_tail_frames=len(buffer), clips=len(rows), crop=crop,
-        crop_x1=box[0], crop_y1=box[1], crop_x2=box[2], crop_y2=box[3],
+        crop_x1=box[0], crop_y1=box[1], crop_x2=box[0] + box[2], crop_y2=box[1] + box[3],
         input_mean=mean, input_std=std, statistics_scope="full_recording_including_tail",
         alignment="BVP_and_video_recording_endpoints_assumed_aligned",
+        detector_status=status,
     )
     return rows, audit
 
@@ -338,18 +325,33 @@ def write_csv(path, fields, rows):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--raw-dir", type=Path, help="UBFC-PHYS root containing sN folders")
+    source.add_argument("--raw-dir", "--data_path", dest="raw_dir", type=Path, help="UBFC-PHYS root containing sN folders")
     source.add_argument("--cache-dir", type=Path, help="Existing paired *_inputN/*_labelN.npy cache")
-    parser.add_argument("--out", type=Path, required=True, help="New or empty output directory")
-    parser.add_argument("--frames", type=int, default=160, help="Frames per new raw-data clip")
+    parser.add_argument("--out", "--cached_path", dest="out", type=Path, required=True, help="New or empty output directory")
+    parser.add_argument("--frames", "--chunk_length", dest="frames", type=int, default=160, help="Frames per new raw-data clip")
     parser.add_argument("--size", type=int, default=128, help="New square RGB crop size")
-    parser.add_argument("--crop", choices=("haar", "full-frame"), default="haar")
+    parser.add_argument("--crop", "--detector", dest="crop", choices=("auto", "haar", "yolo", "full-frame"), default="auto")
+    parser.add_argument("--cascade", type=Path, help="Original Haar XML for detector parity")
+    parser.add_argument("--toolbox-dir", type=Path, help="Optional existing rPPG-Toolbox root for YOLO5Face")
+    parser.add_argument("--yolo_device", "--yolo-device", default="cpu")
+    parser.add_argument("--detect_search_frames", "--detect-search-frames", type=int, default=60)
+    parser.add_argument("--large_box_coef", "--large-box-coef", type=float, default=1.5)
+    parser.add_argument("--fix-full-frame-box", action="store_true", help="Correct the reference's swapped no-face dimensions (changes cache pixels)")
+    parser.add_argument("--data_type", choices=("Standardized",), default="Standardized")
+    parser.add_argument("--label_type", choices=("Standardized",), default="Standardized")
+    storage = parser.add_mutually_exclusive_group()
+    storage.add_argument("--store_uint8", dest="store_uint8", action="store_true", help="Default: raw uint8 RGB; standardize during loading")
+    storage.add_argument("--store-float", dest="store_uint8", action="store_false", help="Save recording-standardized float32 RGB (uses more RAM/disk)")
+    parser.set_defaults(store_uint8=True)
+    parser.add_argument("--tasks", nargs="+", choices=("T1", "T2", "T3"), default=None)
     parser.add_argument("--fps", type=float, help="Actual cache FPS; required with --cache-dir")
     parser.add_argument("--input-representation", choices=("raw", "standardized"),
                         help="Required declaration for existing cache")
     parser.add_argument("--label-representation", choices=("standardized",),
                         help="Required declaration for existing cache; not inferred from values")
     args = parser.parse_args(argv)
+    if args.detect_search_frames < 1 or not np.isfinite(args.large_box_coef) or args.large_box_coef <= 0:
+        parser.error("Detection search length and box coefficient must be positive")
     try:
         validate_dimensions(args.frames, args.size, args.size)
     except ValueError as error:
@@ -372,10 +374,21 @@ def main(argv=None):
     out.mkdir(parents=True, exist_ok=True)
     rows, audit = [], []
     if args.raw_dir:
-        for video, bvp_path in discover_recordings(args.raw_dir):
-            clips, info = convert_recording(video, bvp_path, out, args.frames, args.size, args.crop)
+        pairs = discover_recordings(args.raw_dir)
+        if args.tasks:
+            pairs = [(v, b) for v, b in pairs if identity(v)[1] in args.tasks]
+        if not pairs:
+            raise ValueError("No recordings for the selected tasks")
+        detectors = None if args.crop == "full-frame" else build_detectors(
+            args.crop, args.cascade, args.yolo_device, args.toolbox_dir)
+        print("Storage:", "raw uint8 RGB; --data_type is bypassed" if args.store_uint8 else "standardized float32 RGB")
+        for video, bvp_path in pairs:
+            clips, info = convert_recording(video, bvp_path, out, args.frames, args.size, args.crop,
+                                            detectors, args.detect_search_frames, args.large_box_coef,
+                                            args.fix_full_frame_box, args.store_uint8)
             rows.extend(clips)
             audit.append(info)
+            print(info["detector_status"], flush=True)
             print("{}: {} clips; {:.3f} fps; {} tail frames dropped".format(
                 info["recording"], info["clips"], info["fps"], info["dropped_tail_frames"]
             ), flush=True)
