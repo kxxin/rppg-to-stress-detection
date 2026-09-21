@@ -237,24 +237,3 @@ accuracy claim is included.
 Useful breakpoint locations are `convert_recording()` in preprocessing,
 `PulseDataset.__getitem__()`, `RhythmMamba.forward_features()`,
 `HybridLoss.forward()`, `run_epoch()`, and `evaluate_recording()`.
-
-## GitHub contents and attribution
-
-Upload this folder's Python files, README, requirements, `.gitignore`, and license.
-Generated NumPy arrays, CSV logs, videos, checkpoints, and Python caches are ignored.
-The code writes no JSON files. Dataset access and model weights are not bundled.
-
-The architecture and loss are adapted from
-[RhythmMamba](https://github.com/zizheng-guo/RhythmMamba),
-*RhythmMamba: Fast, Lightweight, and Accurate Remote Physiological Measurement*
-(AAAI 2025), [paper](https://arxiv.org/abs/2404.06483).
-Preserve `LICENSE.txt` and the original copyright attribution when publishing.
-The upstream loss credits PhysFormer and HR-CNN; those references remain relevant
-to the spectral objective. The sparse detrending solver replaces a dense inverse,
-and numerical guards handle degenerate denominators. Unused loss terms/imports
-were removed; the original normalized-power-as-CE-logits convention is retained.
-
-Dataset: [UBFC-PHYS](https://imvia.ube.fr/ubfc-phys/), Sabour et al.,
-*UBFC-Phys: A Multimodal Database For Psychophysiological Studies Of Social Stress*.
-UBFC-PHYS and UBFC-rPPG are different datasets. Cite the dataset and upstream model
-when reporting results.
